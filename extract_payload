@@ -1,0 +1,135 @@
+#!/bin/bash
+#
+# A simple tool to extract the contents of a macOS Big Sur installer
+# to a desired destination. Note that this does not create a bootable
+# installation of Big Sur as it simply dumps the contents of the
+# instal to a folder.
+# 
+# When initially reverse engineering the macOS Big Sur installer when
+# Developer Preview 1 was released, I was stumped by the payload.XYZ
+# file format. I reviewed existing work by Johnathan Levin
+# (http://newosxbook.com/articles/OTA.html) and my previous code for
+# PBZX streams used when reverse engineering the Apple T2 Chip 
+# (https://github.com/toru173/parse_pbzx), but I was unable to make
+# headway.
+#
+# I've since had reason to revisit this for a new project. An
+# interesting point on the iPhone Wiki drew my eye:
+#
+# The payload.000-999 files use the AppleArchive compression.
+# They can be extracted using the built-in macOS yaa command line
+# tool or by adding the .aar extension and opening the file with the 
+# built-in macOS Archive Utility or Keka.
+#
+# (from https://www.theiphonewiki.com/wiki/OTA_Updates)
+#
+# I was indeed able to extract the payload files by appending .aar
+# to them. This, we are able to extract the payload files without
+# ever dealing with the pbzx streams directly! /usr/bin/yaa is a 
+# symlink to /usr/bin/aa so the script uses the later directly.
+
+# Used to simulate the process without actually writing anything
+DRYRUN=false
+
+USAGE_STRING="Usage: ./export_payload /path/to/macOS\ Installer.app /path/to/destination\nMust be run as root"
+
+# trap ctrl-c and call ctrl_c()
+trap ctrl_c INT
+
+function ctrl_c() {
+    echo -en "\nReceived SIGKILL. Cleaning up..."
+    killall -d aa &> /dev/null
+    killall -d unzip &> /dev/null
+    wait
+    hdiutil eject "$OUT_DIR"/.mnt &> /dev/null
+    wait
+    if [[ -d "$OUT_DIR"/.tmp ]]; then
+        rm -rf "$OUT_DIR" &
+        while [ $(pgrep -n -x rm) ]; do
+            sleep 1
+            echo -n "."
+        done
+    fi
+    echo
+    exit 1
+}
+
+if [ $# != 2 ]; then
+    echo -e $USAGE_STRING
+    exit 1
+fi
+
+APP_PATH="$(cd "$(dirname "$1")"; pwd)/$(basename "$1")"
+OUT_DIR="$(cd "$(dirname "$2")"; pwd)/$(basename "$2")"
+
+if [ `whoami` != "root" ]; then
+    echo -e $USAGE_STRING
+    exit 1
+fi
+
+echo "Creating output path..."
+
+mkdir -p "$OUT_DIR"/.tmp &> /dev/null
+
+if [[ $? -ne 0 ]]; then
+    echo -e "Error: Cannot create temporary directory"
+    exit 1
+fi
+
+mkdir "$OUT_DIR"/.mnt 2> /dev/null
+
+echo -n "Mounting SharedSupport.dmg..."
+
+hdiutil attach -nobrowse -mountpoint "$OUT_DIR"/.mnt "$APP_PATH"/Contents/SharedSupport/SharedSupport.dmg &> /dev/null &
+while [ $(pgrep -n -x hdiutil) ]; do
+    sleep 1
+    echo -n "."
+done
+
+echo
+
+if [[ ! -d "$OUT_DIR"/.mnt/com_apple_MobileAsset_MacSoftwareUpdate ]]; then
+    echo -e "Unable to mount SharedSupport.dmg"
+    exit 1
+fi
+
+echo -n "Unzipping files..."
+unzip "$OUT_DIR"/.mnt/com_apple_MobileAsset_MacSoftwareUpdate/*.zip -d "$OUT_DIR"/.tmp/ &> /dev/null &
+while [ $(pgrep -n -x unzip) ]; do
+    sleep 5
+    echo -n "."
+done
+
+echo
+
+hdiutil eject "$OUT_DIR"/.mnt &> /dev/null
+rm -rf "$OUT_DIR"/.mnt
+
+echo "Extracting payload files to $OUT_DIR"
+
+cd "$OUT_DIR"/.tmp/AssetData/payloadv2
+
+PAYLOADS=`find . | grep payload. | grep -v .ecc | grep -v .txt | sort`
+
+for PAYLOAD in ${PAYLOADS[@]}; do
+   echo -n "Extracting $(basename $PAYLOAD)"
+   aa extract -d "$OUT_DIR" -i $PAYLOAD &
+   while [ $(pgrep -n -x aa) ]; do
+       sleep 1
+       echo -n "."
+   done
+   echo
+done
+
+echo -n "Cleaning up..."
+
+rm -rf "$OUT_DIR"/.tmp &
+while [ $(pgrep -n -x rm) ]; do
+    sleep 1
+    echo -n "."
+done
+
+echo
+
+echo "Payload files are available at $OUT_DIR"
+exit 0
